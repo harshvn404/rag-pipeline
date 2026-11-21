@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 python-multipart
 pypdf
+sentence-transformers
+qdrant-client
