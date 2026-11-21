@@ -5,6 +5,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -22,6 +23,8 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -33,10 +36,15 @@ DENSE_VECTOR_NAME = "dense"
 BM25_VECTOR_NAME = "bm25"
 BM25_MODEL_NAME = "Qdrant/bm25"
 
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
 app = FastAPI()
 
 embedding_model = None
 bm25_model = None
+deepseek_client = None
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
@@ -101,6 +109,21 @@ def get_bm25_model():
         logger.info("Loading BM25 sparse model")
         bm25_model = SparseTextEmbedding(BM25_MODEL_NAME)
     return bm25_model
+
+
+def get_deepseek_client():
+    global deepseek_client
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(status_code=500, detail="DEEPSEEK_API_KEY is not set")
+    if deepseek_client is None:
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise RuntimeError(
+                "openai is not installed. Install with: pip install -r backend/requirements.txt"
+            ) from e
+        deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    return deepseek_client
 
 
 def extract_pages(content: bytes) -> list[str]:
@@ -311,6 +334,12 @@ class SearchRequest(BaseModel):
     mode: str = "hybrid"  # hybrid | dense | bm25
 
 
+class AskRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    mode: str = "hybrid"  # hybrid | dense | bm25
+
+
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     content = await file.read()
@@ -346,17 +375,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     }
 
 
-@app.post("/search")
-async def search(request: SearchRequest):
-    query = request.query.strip()
-    mode = request.mode.strip().lower()
-    if not query:
-        raise HTTPException(status_code=400, detail="query must not be empty")
-    if request.top_k < 1:
-        raise HTTPException(status_code=400, detail="top_k must be >= 1")
-    if mode not in {"hybrid", "dense", "bm25"}:
-        raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
-
+def retrieve_matches(query: str, top_k: int, mode: str) -> list[dict]:
     dense_vector = None
     sparse_vector = None
     if mode in {"hybrid", "dense"}:
@@ -373,7 +392,7 @@ async def search(request: SearchRequest):
                 collection_name=QDRANT_COLLECTION,
                 query=dense_vector,
                 using=DENSE_VECTOR_NAME,
-                limit=request.top_k,
+                limit=top_k,
                 with_payload=True,
             )
         elif mode == "bm25":
@@ -381,11 +400,11 @@ async def search(request: SearchRequest):
                 collection_name=QDRANT_COLLECTION,
                 query=sparse_vector,
                 using=BM25_VECTOR_NAME,
-                limit=request.top_k,
+                limit=top_k,
                 with_payload=True,
             )
         else:
-            prefetch_limit = max(request.top_k * 3, 10)
+            prefetch_limit = max(top_k * 3, 10)
             response = qdrant_client.query_points(
                 collection_name=QDRANT_COLLECTION,
                 prefetch=[
@@ -393,7 +412,7 @@ async def search(request: SearchRequest):
                     Prefetch(query=sparse_vector, using=BM25_VECTOR_NAME, limit=prefetch_limit),
                 ],
                 query=FusionQuery(fusion=Fusion.RRF),
-                limit=request.top_k,
+                limit=top_k,
                 with_payload=True,
             )
         results = response.points
@@ -415,5 +434,93 @@ async def search(request: SearchRequest):
                 "upload_id": payload.get("upload_id"),
             }
         )
+    return matches
 
+
+def build_context(matches: list[dict], max_chars: int = 12000) -> str:
+    parts = []
+    total = 0
+    for i, m in enumerate(matches, start=1):
+        text = (m.get("text") or "").strip()
+        snippet = (
+            f"[Source {i} | file={m.get('filename')} | page={m.get('page')} | score={m.get('score')}]\n"
+            f"{text}"
+        )
+        if total + len(snippet) > max_chars and parts:
+            break
+        parts.append(snippet)
+        total += len(snippet)
+    return "\n\n".join(parts)
+
+
+def generate_answer(query: str, matches: list[dict]) -> str:
+    context = build_context(matches)
+    if not context:
+        return "I don't know from the provided documents."
+
+    client = get_deepseek_client()
+    system_prompt = (
+        "You are a helpful assistant for document Q&A. "
+        "Answer only using the provided context. "
+        "If the answer is not in the context, say you don't know from the provided documents. "
+        "Cite sources by filename and page when relevant."
+    )
+    user_prompt = f"Question:\n{query}\n\nContext:\n{context}"
+
+    try:
+        completion = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            stream=False,
+        )
+    except Exception as e:
+        logger.exception("DeepSeek request failed")
+        raise HTTPException(status_code=502, detail=f"DeepSeek request failed: {e}") from e
+
+    answer = completion.choices[0].message.content if completion.choices else ""
+    return (answer or "").strip()
+
+
+@app.post("/search")
+async def search(request: SearchRequest):
+    query = request.query.strip()
+    mode = request.mode.strip().lower()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    if request.top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1")
+    if mode not in {"hybrid", "dense", "bm25"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
+
+    matches = retrieve_matches(query, request.top_k, mode)
     return {"query": query, "top_k": request.top_k, "mode": mode, "results": matches}
+
+
+@app.post("/ask")
+async def ask(request: AskRequest):
+    query = request.query.strip()
+    mode = request.mode.strip().lower()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    if request.top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1")
+    if mode not in {"hybrid", "dense", "bm25"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
+
+    matches = retrieve_matches(query, request.top_k, mode)
+    answer = generate_answer(query, matches)
+    sources = [
+        {
+            "filename": m.get("filename"),
+            "page": m.get("page"),
+            "chunk_index": m.get("chunk_index"),
+            "score": m.get("score"),
+            "upload_id": m.get("upload_id"),
+        }
+        for m in matches
+    ]
+    return {"query": query, "mode": mode, "top_k": request.top_k, "answer": answer, "sources": sources}

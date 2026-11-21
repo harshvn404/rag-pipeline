@@ -5,3 +5,5 @@ pypdf
 sentence-transformers
 qdrant-client
 fastembed
+openai
+python-dotenv
