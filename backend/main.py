@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
@@ -141,6 +142,11 @@ def store_vectors(chunks: list[dict], embeddings: list[list[float]], filename: s
     return upload_id, len(points)
 
 
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     content = await file.read()
@@ -171,3 +177,43 @@ async def upload_pdf(file: UploadFile = File(...)):
         "collection": QDRANT_COLLECTION,
         "vectors_stored": vectors_stored,
     }
+
+
+@app.post("/search")
+async def search(request: SearchRequest):
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+    if request.top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1")
+
+    model = get_embedding_model()
+    query_vector = model.encode(query, show_progress_bar=False).tolist()
+
+    try:
+        results = qdrant_client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_vector,
+            limit=request.top_k,
+            with_payload=True,
+        ).points
+    except Exception as e:
+        logger.exception("Qdrant search failed")
+        raise HTTPException(status_code=500, detail=f"Qdrant search failed: {e}") from e
+
+    matches = []
+    for point in results:
+        payload = point.payload or {}
+        matches.append(
+            {
+                "id": str(point.id),
+                "score": point.score,
+                "text": payload.get("text"),
+                "filename": payload.get("filename"),
+                "page": payload.get("page"),
+                "chunk_index": payload.get("chunk_index"),
+                "upload_id": payload.get("upload_id"),
+            }
+        )
+
+    return {"query": query, "top_k": request.top_k, "results": matches}
