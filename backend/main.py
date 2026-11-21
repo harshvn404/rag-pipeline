@@ -9,7 +9,18 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    Fusion,
+    FusionQuery,
+    Modifier,
+    PayloadSchemaType,
+    PointStruct,
+    Prefetch,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,10 +29,14 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "pdf_chunks")
 EMBEDDING_SIZE = 384
+DENSE_VECTOR_NAME = "dense"
+BM25_VECTOR_NAME = "bm25"
+BM25_MODEL_NAME = "Qdrant/bm25"
 
 app = FastAPI()
 
 embedding_model = None
+bm25_model = None
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
@@ -31,7 +46,12 @@ def ensure_collection() -> None:
         if QDRANT_COLLECTION not in collections:
             qdrant_client.create_collection(
                 collection_name=QDRANT_COLLECTION,
-                vectors_config=VectorParams(size=EMBEDDING_SIZE, distance=Distance.COSINE),
+                vectors_config={
+                    DENSE_VECTOR_NAME: VectorParams(size=EMBEDDING_SIZE, distance=Distance.COSINE),
+                },
+                sparse_vectors_config={
+                    BM25_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF),
+                },
             )
             logger.info("Created Qdrant collection: %s", QDRANT_COLLECTION)
 
@@ -66,6 +86,21 @@ def get_embedding_model():
         logger.info("Loading embedding model")
         embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     return embedding_model
+
+
+def get_bm25_model():
+    global bm25_model
+    if bm25_model is None:
+        try:
+            from fastembed import SparseTextEmbedding
+        except ImportError as e:
+            raise RuntimeError(
+                "fastembed is not installed. Install with: pip install -r backend/requirements.txt"
+            ) from e
+
+        logger.info("Loading BM25 sparse model")
+        bm25_model = SparseTextEmbedding(BM25_MODEL_NAME)
+    return bm25_model
 
 
 def extract_pages(content: bytes) -> list[str]:
@@ -206,25 +241,46 @@ def create_chunks(pages: list[str]) -> list[dict]:
     return chunks
 
 
-def create_embeddings(chunks: list[dict]) -> list[list[float]]:
+def create_dense_embeddings(chunks: list[dict]) -> list[list[float]]:
     texts = [chunk["text"] for chunk in chunks]
     if not texts:
         return []
     model = get_embedding_model()
-    logger.info("Creating embeddings for %s chunks", len(texts))
+    logger.info("Creating dense embeddings for %s chunks", len(texts))
     embeddings = model.encode(texts, show_progress_bar=False)
     return embeddings.tolist()
 
 
-def store_vectors(chunks: list[dict], embeddings: list[list[float]], filename: str) -> tuple[str, int]:
+def create_sparse_embeddings(chunks: list[dict]) -> list[SparseVector]:
+    texts = [chunk["text"] for chunk in chunks]
+    if not texts:
+        return []
+    model = get_bm25_model()
+    logger.info("Creating BM25 sparse embeddings for %s chunks", len(texts))
+    embeddings = list(model.embed(texts))
+    return [
+        SparseVector(indices=emb.indices.tolist(), values=emb.values.tolist())
+        for emb in embeddings
+    ]
+
+
+def store_vectors(
+    chunks: list[dict],
+    dense_embeddings: list[list[float]],
+    sparse_embeddings: list[SparseVector],
+    filename: str,
+) -> tuple[str, int]:
     upload_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     points = []
-    for chunk, embedding in zip(chunks, embeddings):
+    for chunk, dense_embedding, sparse_embedding in zip(chunks, dense_embeddings, sparse_embeddings):
         points.append(
             PointStruct(
                 id=str(uuid.uuid4()),
-                vector=embedding,
+                vector={
+                    DENSE_VECTOR_NAME: dense_embedding,
+                    BM25_VECTOR_NAME: sparse_embedding,
+                },
                 payload={
                     "upload_id": upload_id,
                     "filename": filename,
@@ -252,6 +308,7 @@ def store_vectors(chunks: list[dict], embeddings: list[list[float]], filename: s
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
+    mode: str = "hybrid"  # hybrid | dense | bm25
 
 
 @app.post("/upload-pdf")
@@ -271,16 +328,19 @@ async def upload_pdf(file: UploadFile = File(...)):
             chunk["text"][:200],
         )
 
-    embeddings = create_embeddings(chunks)
-    upload_id, vectors_stored = store_vectors(chunks, embeddings, file.filename or "unknown.pdf")
+    dense_embeddings = create_dense_embeddings(chunks)
+    sparse_embeddings = create_sparse_embeddings(chunks)
+    upload_id, vectors_stored = store_vectors(
+        chunks, dense_embeddings, sparse_embeddings, file.filename or "unknown.pdf"
+    )
 
     return {
         "upload_id": upload_id,
         "filename": file.filename,
         "pages": len(pages),
         "chunks": len(chunks),
-        "embeddings_created": len(embeddings),
-        "embedding_dimension": len(embeddings[0]) if embeddings else 0,
+        "embeddings_created": len(dense_embeddings),
+        "embedding_dimension": len(dense_embeddings[0]) if dense_embeddings else 0,
         "collection": QDRANT_COLLECTION,
         "vectors_stored": vectors_stored,
     }
@@ -289,21 +349,54 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/search")
 async def search(request: SearchRequest):
     query = request.query.strip()
+    mode = request.mode.strip().lower()
     if not query:
         raise HTTPException(status_code=400, detail="query must not be empty")
     if request.top_k < 1:
         raise HTTPException(status_code=400, detail="top_k must be >= 1")
+    if mode not in {"hybrid", "dense", "bm25"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
 
-    model = get_embedding_model()
-    query_vector = model.encode(query, show_progress_bar=False).tolist()
+    dense_vector = None
+    sparse_vector = None
+    if mode in {"hybrid", "dense"}:
+        dense_model = get_embedding_model()
+        dense_vector = dense_model.encode(query, show_progress_bar=False).tolist()
+    if mode in {"hybrid", "bm25"}:
+        bm25_model = get_bm25_model()
+        sparse_emb = next(bm25_model.embed([query]))
+        sparse_vector = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
 
     try:
-        results = qdrant_client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=query_vector,
-            limit=request.top_k,
-            with_payload=True,
-        ).points
+        if mode == "dense":
+            response = qdrant_client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=dense_vector,
+                using=DENSE_VECTOR_NAME,
+                limit=request.top_k,
+                with_payload=True,
+            )
+        elif mode == "bm25":
+            response = qdrant_client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=sparse_vector,
+                using=BM25_VECTOR_NAME,
+                limit=request.top_k,
+                with_payload=True,
+            )
+        else:
+            prefetch_limit = max(request.top_k * 3, 10)
+            response = qdrant_client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                prefetch=[
+                    Prefetch(query=dense_vector, using=DENSE_VECTOR_NAME, limit=prefetch_limit),
+                    Prefetch(query=sparse_vector, using=BM25_VECTOR_NAME, limit=prefetch_limit),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=request.top_k,
+                with_payload=True,
+            )
+        results = response.points
     except Exception as e:
         logger.exception("Qdrant search failed")
         raise HTTPException(status_code=500, detail=f"Qdrant search failed: {e}") from e
@@ -323,4 +416,4 @@ async def search(request: SearchRequest):
             }
         )
 
-    return {"query": query, "top_k": request.top_k, "results": matches}
+    return {"query": query, "top_k": request.top_k, "mode": mode, "results": matches}
