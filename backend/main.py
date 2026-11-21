@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -77,18 +78,124 @@ def extract_pages(content: bytes) -> list[str]:
     return pages
 
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
-    if not text:
-        return []
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        if end >= len(text):
+def normalize_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", text.strip())
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def split_long_text(text: str, max_size: int) -> list[str]:
+    sentences = split_sentences(text)
+    if len(sentences) <= 1:
+        return [text[i : i + max_size].strip() for i in range(0, len(text), max_size) if text[i : i + max_size].strip()]
+
+    units: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if len(sentence) > max_size:
+            if current:
+                units.append(current.strip())
+                current = ""
+            units.extend(split_long_text(sentence, max_size))
+            continue
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= max_size:
+            current = candidate
+        else:
+            if current:
+                units.append(current.strip())
+            current = sentence
+    if current:
+        units.append(current.strip())
+    return units
+
+
+def split_into_units(text: str, max_size: int) -> list[str]:
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    units: list[str] = []
+    for paragraph in paragraphs:
+        if len(paragraph) <= max_size:
+            units.append(paragraph)
+        else:
+            units.extend(split_long_text(paragraph, max_size))
+    return units
+
+
+def get_overlap_units(chunks: list[str], overlap: int) -> str:
+    if overlap <= 0 or not chunks:
+        return ""
+    selected: list[str] = []
+    size = 0
+    for chunk in reversed(chunks):
+        chunk_len = len(chunk) + (2 if selected else 0)
+        if selected and size + chunk_len > overlap:
             break
-        start = end - overlap
-    return chunks
+        selected.insert(0, chunk)
+        size += chunk_len
+        if size >= overlap:
+            break
+    overlap_text = "\n\n".join(selected).strip()
+    if len(overlap_text) > overlap:
+        overlap_text = overlap_text[-overlap:].strip()
+    return overlap_text
+
+
+def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+
+    units = split_into_units(normalized, chunk_size)
+    if not units:
+        return []
+
+    overlap = max(0, min(overlap, chunk_size - 1))
+    chunks: list[str] = []
+    current = ""
+    current_units: list[str] = []
+
+    for unit in units:
+        candidate = f"{current}\n\n{unit}".strip() if current else unit
+        if len(candidate) <= chunk_size:
+            current = candidate
+            current_units.append(unit)
+            continue
+
+        if current:
+            chunks.append(current.strip())
+            overlap_text = get_overlap_units(current_units, overlap)
+            current = f"{overlap_text}\n\n{unit}".strip() if overlap_text else unit
+            current_units = [overlap_text, unit] if overlap_text else [unit]
+            while len(current) > chunk_size and current_units:
+                if len(current_units) == 1:
+                    for part in split_long_text(current_units[0], chunk_size):
+                        chunks.append(part.strip())
+                    current = ""
+                    current_units = []
+                    break
+                # drop oldest overlap unit to fit
+                current_units.pop(0)
+                current = "\n\n".join(u for u in current_units if u).strip()
+        else:
+            for part in split_long_text(unit, chunk_size):
+                chunks.append(part.strip())
+            current = ""
+            current_units = []
+
+    if current:
+        chunks.append(current.strip())
+
+    deduped: list[str] = []
+    for chunk in chunks:
+        if chunk and (not deduped or chunk != deduped[-1]):
+            deduped.append(chunk)
+    return deduped
 
 
 def create_chunks(pages: list[str]) -> list[dict]:
