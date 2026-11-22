@@ -524,3 +524,8 @@ async def ask(request: AskRequest):
         for m in matches
     ]
     return {"query": query, "mode": mode, "top_k": request.top_k, "answer": answer, "sources": sources}
+
+def main():
+    import uvicorn
+
+    uvicorn.run("backend.main:app", reload=True)
