@@ -3,17 +3,23 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import bcrypt
+import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    FieldCondition,
+    Filter,
     Fusion,
     FusionQuery,
+    MatchValue,
     Modifier,
     PayloadSchemaType,
     PointStruct,
@@ -22,6 +28,8 @@ from qdrant_client.models import (
     SparseVectorParams,
     VectorParams,
 )
+from sqlalchemy import Column, DateTime, String, create_engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 load_dotenv()
 
@@ -40,12 +48,41 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-env")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+
 app = FastAPI()
+security = HTTPBearer()
 
 embedding_model = None
 bm25_model = None
 deepseek_client = None
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def ensure_collection() -> None:
@@ -64,21 +101,65 @@ def ensure_collection() -> None:
             logger.info("Created Qdrant collection: %s", QDRANT_COLLECTION)
 
         collection_info = qdrant_client.get_collection(QDRANT_COLLECTION)
-        if "filename" not in collection_info.payload_schema:
+        payload_schema = collection_info.payload_schema
+        if "filename" not in payload_schema:
             qdrant_client.create_payload_index(
                 collection_name=QDRANT_COLLECTION,
                 field_name="filename",
                 field_schema=PayloadSchemaType.KEYWORD,
             )
             logger.info("Created payload index on filename for %s", QDRANT_COLLECTION)
+        if "user_id" not in payload_schema:
+            qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="user_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            logger.info("Created payload index on user_id for %s", QDRANT_COLLECTION)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Qdrant collection '{QDRANT_COLLECTION}': {e}") from e
 
 
 @app.on_event("startup")
 def on_startup() -> None:
+    Base.metadata.create_all(bind=engine)
     ensure_collection()
     logger.info("Qdrant ready: url=%s collection=%s", QDRANT_URL, QDRANT_COLLECTION)
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+
+def create_access_token(user_id: str, username: str) -> str:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": user_id, "username": username, "exp": expires_at}
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except jwt.ExpiredSignatureError as e:
+        raise HTTPException(status_code=401, detail="Token expired") from e
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail="Invalid token") from e
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
 
 
 def get_embedding_model():
@@ -292,6 +373,7 @@ def store_vectors(
     dense_embeddings: list[list[float]],
     sparse_embeddings: list[SparseVector],
     filename: str,
+    user_id: str,
 ) -> tuple[str, int]:
     upload_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -306,6 +388,7 @@ def store_vectors(
                 },
                 payload={
                     "upload_id": upload_id,
+                    "user_id": user_id,
                     "filename": filename,
                     "page": chunk["page"],
                     "chunk_index": chunk["chunk_index"],
@@ -340,8 +423,55 @@ class AskRequest(BaseModel):
     mode: str = "hybrid"  # hybrid | dense | bm25
 
 
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/register")
+def register(request: AuthRequest, db: Session = Depends(get_db)):
+    username = request.username.strip()
+    password = request.password
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+    if len(username) < 3 or len(password) < 6:
+        raise HTTPException(status_code=400, detail="username must be >=3 chars and password >=6 chars")
+
+    existing = db.query(User).filter(User.username == username).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="username already exists")
+
+    user = User(
+        id=str(uuid.uuid4()),
+        username=username,
+        password_hash=hash_password(password),
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token(user.id, user.username)
+    return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "username": user.username}}
+
+
+@app.post("/auth/login")
+def login(request: AuthRequest, db: Session = Depends(get_db)):
+    username = request.username.strip()
+    password = request.password
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="invalid username or password")
+
+    token = create_access_token(user.id, user.username)
+    return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "username": user.username}}
+
+
 @app.post("/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
     content = await file.read()
     logger.info("Received PDF: filename=%s size=%s", file.filename, len(content))
 
@@ -360,7 +490,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     dense_embeddings = create_dense_embeddings(chunks)
     sparse_embeddings = create_sparse_embeddings(chunks)
     upload_id, vectors_stored = store_vectors(
-        chunks, dense_embeddings, sparse_embeddings, file.filename or "unknown.pdf"
+        chunks, dense_embeddings, sparse_embeddings, file.filename or "unknown.pdf", current_user.id
     )
 
     return {
@@ -375,7 +505,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     }
 
 
-def retrieve_matches(query: str, top_k: int, mode: str) -> list[dict]:
+def retrieve_matches(query: str, top_k: int, mode: str, user_id: str) -> list[dict]:
     dense_vector = None
     sparse_vector = None
     if mode in {"hybrid", "dense"}:
@@ -386,12 +516,15 @@ def retrieve_matches(query: str, top_k: int, mode: str) -> list[dict]:
         sparse_emb = next(bm25_model.embed([query]))
         sparse_vector = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
 
+    user_filter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+
     try:
         if mode == "dense":
             response = qdrant_client.query_points(
                 collection_name=QDRANT_COLLECTION,
                 query=dense_vector,
                 using=DENSE_VECTOR_NAME,
+                query_filter=user_filter,
                 limit=top_k,
                 with_payload=True,
             )
@@ -400,6 +533,7 @@ def retrieve_matches(query: str, top_k: int, mode: str) -> list[dict]:
                 collection_name=QDRANT_COLLECTION,
                 query=sparse_vector,
                 using=BM25_VECTOR_NAME,
+                query_filter=user_filter,
                 limit=top_k,
                 with_payload=True,
             )
@@ -408,8 +542,8 @@ def retrieve_matches(query: str, top_k: int, mode: str) -> list[dict]:
             response = qdrant_client.query_points(
                 collection_name=QDRANT_COLLECTION,
                 prefetch=[
-                    Prefetch(query=dense_vector, using=DENSE_VECTOR_NAME, limit=prefetch_limit),
-                    Prefetch(query=sparse_vector, using=BM25_VECTOR_NAME, limit=prefetch_limit),
+                    Prefetch(query=dense_vector, using=DENSE_VECTOR_NAME, limit=prefetch_limit, filter=user_filter),
+                    Prefetch(query=sparse_vector, using=BM25_VECTOR_NAME, limit=prefetch_limit, filter=user_filter),
                 ],
                 query=FusionQuery(fusion=Fusion.RRF),
                 limit=top_k,
@@ -486,7 +620,7 @@ def generate_answer(query: str, matches: list[dict]) -> str:
 
 
 @app.post("/search")
-async def search(request: SearchRequest):
+async def search(request: SearchRequest, current_user: User = Depends(get_current_user)):
     query = request.query.strip()
     mode = request.mode.strip().lower()
     if not query:
@@ -496,12 +630,12 @@ async def search(request: SearchRequest):
     if mode not in {"hybrid", "dense", "bm25"}:
         raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
 
-    matches = retrieve_matches(query, request.top_k, mode)
+    matches = retrieve_matches(query, request.top_k, mode, current_user.id)
     return {"query": query, "top_k": request.top_k, "mode": mode, "results": matches}
 
 
 @app.post("/ask")
-async def ask(request: AskRequest):
+async def ask(request: AskRequest, current_user: User = Depends(get_current_user)):
     query = request.query.strip()
     mode = request.mode.strip().lower()
     if not query:
@@ -511,7 +645,7 @@ async def ask(request: AskRequest):
     if mode not in {"hybrid", "dense", "bm25"}:
         raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
 
-    matches = retrieve_matches(query, request.top_k, mode)
+    matches = retrieve_matches(query, request.top_k, mode, current_user.id)
     answer = generate_answer(query, matches)
     sources = [
         {

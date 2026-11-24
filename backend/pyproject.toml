@@ -8,14 +8,17 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "bcrypt>=4.2.0",
     "fastapi>=0.165.0",
     "fastembed>=0.9.1",
     "openai>=3.57.0",
+    "pyjwt>=2.10.1",
     "pypdf>=7.1.1",
     "python-dotenv>=1.2.4",
     "python-multipart>=0.0.34",
     "qdrant-client>=1.20.0",
     "sentence-transformers>=6.3.0",
+    "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.54.0",
 ]
 
