@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,8 +12,9 @@ import bcrypt
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -20,6 +23,7 @@ from qdrant_client.models import (
     Filter,
     Fusion,
     FusionQuery,
+    MatchAny,
     MatchValue,
     Modifier,
     PayloadSchemaType,
@@ -50,6 +54,7 @@ QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "10"))
 MAX_PDF_SIZE_BYTES = int(os.getenv("MAX_PDF_SIZE_MB", "50")) * 1024 * 1024
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "500"))
 MAX_CHUNKS_PER_PDF = int(os.getenv("MAX_CHUNKS_PER_PDF", "20000"))
+INDEX_WAIT_SECONDS = int(os.getenv("INDEX_WAIT_SECONDS", "15"))
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -60,8 +65,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BACKEND_DIR / "uploads"))).resolve()
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 security = HTTPBearer()
 
 embedding_model = None
@@ -104,6 +120,37 @@ class Document(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class Chat(Base):
+    __tablename__ = "chats"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
+    title = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(String, primary_key=True, index=True)
+    chat_id = Column(String, index=True, nullable=False)
+    user_id = Column(String, index=True, nullable=False)
+    role = Column(String, index=True, nullable=False)
+    content = Column(Text, nullable=False)
+    sources_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class ChatDocument(Base):
+    __tablename__ = "chat_documents"
+
+    chat_id = Column(String, primary_key=True)
+    document_id = Column(String, primary_key=True)
+    user_id = Column(String, index=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 def get_db():
@@ -512,6 +559,21 @@ class AuthRequest(BaseModel):
     password: str
 
 
+class CreateChatRequest(BaseModel):
+    title: str | None = None
+    document_ids: list[str] = Field(default_factory=list)
+
+
+class ChatMessageRequest(BaseModel):
+    content: str
+    top_k: int = 5
+    mode: str = "hybrid"
+
+
+class AddChatDocumentsRequest(BaseModel):
+    document_ids: list[str] = Field(default_factory=list)
+
+
 def process_document(document_id: str) -> None:
     db = SessionLocal()
     user_id_for_cleanup = None
@@ -726,7 +788,13 @@ async def upload_pdf(
     }
 
 
-def retrieve_matches(query: str, top_k: int, mode: str, user_id: str) -> list[dict]:
+def retrieve_matches(
+    query: str,
+    top_k: int,
+    mode: str,
+    user_id: str,
+    document_ids: list[str] | None = None,
+) -> list[dict]:
     dense_vector = None
     sparse_vector = None
     if mode in {"hybrid", "dense"}:
@@ -737,7 +805,10 @@ def retrieve_matches(query: str, top_k: int, mode: str, user_id: str) -> list[di
         sparse_emb = next(bm25_model.embed([query]))
         sparse_vector = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
 
-    user_filter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+    conditions = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+    if document_ids:
+        conditions.append(FieldCondition(key="document_id", match=MatchAny(any=document_ids)))
+    user_filter = Filter(must=conditions)
 
     try:
         if mode == "dense":
@@ -841,6 +912,98 @@ def generate_answer(query: str, matches: list[dict]) -> str:
     return (answer or "").strip()
 
 
+def serialize_sources(matches: list[dict]) -> list[dict]:
+    return [
+        {
+            "filename": match.get("filename"),
+            "page": match.get("page"),
+            "chunk_index": match.get("chunk_index"),
+            "score": match.get("score"),
+            "upload_id": match.get("upload_id"),
+            "document_id": match.get("document_id"),
+        }
+        for match in matches
+    ]
+
+
+def serialize_document(document: Document) -> dict:
+    return {
+        "id": document.id,
+        "upload_id": document.upload_id,
+        "filename": document.filename,
+        "size": document.size,
+        "status": document.status,
+        "pages": document.pages,
+        "chunks": document.chunks,
+        "vectors_stored": document.vectors_stored,
+        "error": document.error,
+        "created_at": document.created_at,
+        "updated_at": document.updated_at,
+    }
+
+
+def serialize_chat(chat: Chat, documents: list[Document]) -> dict:
+    return {
+        "id": chat.id,
+        "title": chat.title,
+        "created_at": chat.created_at,
+        "updated_at": chat.updated_at,
+        "documents": [serialize_document(document) for document in documents],
+    }
+
+
+def serialize_message(message: Message) -> dict:
+    try:
+        sources = json.loads(message.sources_json) if message.sources_json else []
+    except json.JSONDecodeError:
+        sources = []
+    return {
+        "id": message.id,
+        "chat_id": message.chat_id,
+        "role": message.role,
+        "content": message.content,
+        "sources": sources,
+        "created_at": message.created_at,
+    }
+
+
+def wait_for_document_indexing(document_ids: list[str]) -> None:
+    if not document_ids or INDEX_WAIT_SECONDS <= 0:
+        return
+
+    deadline = time.monotonic() + INDEX_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        db = SessionLocal()
+        try:
+            documents = db.query(Document).filter(Document.id.in_(document_ids)).all()
+            statuses = [document.status for document in documents]
+        finally:
+            db.close()
+
+        if len(statuses) == len(set(document_ids)) and all(
+            status in {"completed", "failed"} for status in statuses
+        ):
+            return
+        time.sleep(0.5)
+
+
+def get_user_chat(db: Session, chat_id: str, user_id: str) -> Chat:
+    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user_id).first()
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return chat
+
+
+def chat_documents(db: Session, chat_id: str) -> list[Document]:
+    return (
+        db.query(Document)
+        .join(ChatDocument, ChatDocument.document_id == Document.id)
+        .filter(ChatDocument.chat_id == chat_id)
+        .order_by(Document.created_at.asc())
+        .all()
+    )
+
+
 @app.post("/search")
 async def search(request: SearchRequest, current_user: User = Depends(get_current_user)):
     query = request.query.strip()
@@ -869,18 +1032,212 @@ async def ask(request: AskRequest, current_user: User = Depends(get_current_user
 
     matches = retrieve_matches(query, request.top_k, mode, current_user.id)
     answer = generate_answer(query, matches)
-    sources = [
-        {
-            "filename": m.get("filename"),
-            "page": m.get("page"),
-            "chunk_index": m.get("chunk_index"),
-            "score": m.get("score"),
-            "upload_id": m.get("upload_id"),
-            "document_id": m.get("document_id"),
-        }
-        for m in matches
-    ]
+    sources = serialize_sources(matches)
     return {"query": query, "mode": mode, "top_k": request.top_k, "answer": answer, "sources": sources}
+
+
+@app.get("/documents")
+def list_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    documents = (
+        db.query(Document)
+        .filter(Document.user_id == current_user.id)
+        .order_by(Document.created_at.desc())
+        .all()
+    )
+    return [serialize_document(document) for document in documents]
+
+
+@app.post("/chats")
+def create_chat(
+    request: CreateChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    document_ids = list(dict.fromkeys(request.document_ids))
+    documents = []
+    if document_ids:
+        documents = (
+            db.query(Document)
+            .filter(Document.id.in_(document_ids), Document.user_id == current_user.id)
+            .all()
+        )
+        if len(documents) != len(document_ids):
+            raise HTTPException(status_code=404, detail="One or more documents were not found")
+        documents_by_id = {document.id: document for document in documents}
+        documents = [documents_by_id[document_id] for document_id in document_ids]
+
+    title = request.title.strip() if request.title and request.title.strip() else "New chat"
+    chat = Chat(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        title=title,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    db.add(chat)
+    for document_id in document_ids:
+        db.add(
+            ChatDocument(
+                chat_id=chat.id,
+                document_id=document_id,
+                user_id=current_user.id,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+    db.commit()
+    db.refresh(chat)
+    return serialize_chat(chat, documents)
+
+
+@app.post("/chats/{chat_id}/documents")
+def add_chat_documents(
+    chat_id: str,
+    request: AddChatDocumentsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    chat = get_user_chat(db, chat_id, current_user.id)
+    document_ids = list(dict.fromkeys(request.document_ids))
+
+    if document_ids:
+        documents = (
+            db.query(Document)
+            .filter(Document.id.in_(document_ids), Document.user_id == current_user.id)
+            .all()
+        )
+        if len(documents) != len(document_ids):
+            raise HTTPException(status_code=404, detail="One or more documents were not found")
+
+    existing_ids = {
+        link.document_id
+        for link in db.query(ChatDocument).filter(ChatDocument.chat_id == chat.id).all()
+    }
+    for document_id in document_ids:
+        if document_id not in existing_ids:
+            db.add(
+                ChatDocument(
+                    chat_id=chat.id,
+                    document_id=document_id,
+                    user_id=current_user.id,
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+
+    chat.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(chat)
+    return serialize_chat(chat, chat_documents(db, chat.id))
+
+
+@app.get("/chats")
+def list_chats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    chats = (
+        db.query(Chat)
+        .filter(Chat.user_id == current_user.id)
+        .order_by(Chat.updated_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": chat.id,
+            "title": chat.title,
+            "created_at": chat.created_at,
+            "updated_at": chat.updated_at,
+        }
+        for chat in chats
+    ]
+
+
+@app.get("/chats/{chat_id}")
+def get_chat(
+    chat_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    chat = get_user_chat(db, chat_id, current_user.id)
+    documents = chat_documents(db, chat.id)
+    messages = (
+        db.query(Message)
+        .filter(Message.chat_id == chat.id, Message.user_id == current_user.id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    return {
+        **serialize_chat(chat, documents),
+        "messages": [serialize_message(message) for message in messages],
+    }
+
+
+@app.post("/chats/{chat_id}/messages")
+async def create_chat_message(
+    chat_id: str,
+    request: ChatMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    content = request.content.strip()
+    mode = request.mode.strip().lower()
+    if not content:
+        raise HTTPException(status_code=400, detail="content must not be empty")
+    if request.top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1")
+    if mode not in {"hybrid", "dense", "bm25"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: hybrid, dense, bm25")
+
+    chat = get_user_chat(db, chat_id, current_user.id)
+    documents = chat_documents(db, chat.id)
+    document_ids = [document.id for document in documents]
+    previous_messages = (
+        db.query(Message)
+        .filter(Message.chat_id == chat.id, Message.user_id == current_user.id)
+        .count()
+    )
+    now = datetime.now(timezone.utc)
+
+    user_message = Message(
+        id=str(uuid.uuid4()),
+        chat_id=chat.id,
+        user_id=current_user.id,
+        role="user",
+        content=content,
+        created_at=now,
+    )
+    db.add(user_message)
+    if previous_messages == 0 and chat.title == "New chat":
+        chat.title = content[:80]
+    chat.updated_at = now
+    db.commit()
+    db.refresh(user_message)
+
+    await asyncio.to_thread(wait_for_document_indexing, document_ids)
+    matches = retrieve_matches(content, request.top_k, mode, current_user.id, document_ids or None)
+    sources = serialize_sources(matches)
+    answer = generate_answer(content, matches)
+    assistant_message = Message(
+        id=str(uuid.uuid4()),
+        chat_id=chat.id,
+        user_id=current_user.id,
+        role="assistant",
+        content=answer,
+        sources_json=json.dumps(sources),
+        created_at=datetime.now(timezone.utc),
+    )
+    chat.updated_at = assistant_message.created_at
+    db.add(assistant_message)
+    db.commit()
+    db.refresh(assistant_message)
+
+    return {
+        "user_message": serialize_message(user_message),
+        "assistant_message": serialize_message(assistant_message),
+    }
+
 
 def main():
     import uvicorn

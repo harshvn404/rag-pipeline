@@ -1,0 +1,188 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+
+  --canvas: light-dark(oklch(98% 0.004 250), oklch(15% 0.004 250));
+  --panel: light-dark(oklch(100% 0 0), oklch(18.5% 0.004 250));
+  --raised: light-dark(oklch(95.5% 0.005 250), oklch(22% 0.005 250));
+  --line: light-dark(oklch(22% 0.012 250 / 0.11), oklch(92% 0.005 250 / 0.12));
+  --ink: light-dark(oklch(22% 0.012 250), oklch(94% 0.005 250));
+  --secondary: light-dark(oklch(42% 0.012 250), oklch(75% 0.006 250));
+  --muted: light-dark(oklch(56% 0.01 250), oklch(62% 0.006 250));
+  --accent: light-dark(oklch(46% 0.145 250), oklch(70% 0.13 250));
+  --accent-ink: light-dark(oklch(100% 0 0), oklch(15% 0.004 250));
+  --positive: light-dark(oklch(44% 0.11 155), oklch(72% 0.11 155));
+  --negative: light-dark(oklch(48% 0.16 25), oklch(72% 0.13 25));
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-secondary: var(--secondary);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-positive: var(--positive);
+  --color-negative: var(--negative);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  border-color: var(--line);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-geist-sans), Arial, sans-serif;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+section[id] {
+  scroll-margin-top: 24px;
+}
+
+.skip-link {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 50;
+  border-radius: 8px;
+  background: var(--ink);
+  padding: 8px 12px;
+  color: var(--canvas);
+  font-size: 14px;
+  font-weight: 600;
+  transform: translateY(-160%);
+  transition: transform 140ms var(--ease-out);
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.field {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 10px 12px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+  transition: border-color 140ms var(--ease-out), background-color 140ms var(--ease-out);
+}
+
+.field::placeholder {
+  color: var(--muted);
+}
+
+.field:hover {
+  border-color: color-mix(in oklab, var(--ink) 24%, var(--line));
+}
+
+.field:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 0 14px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background-color 140ms var(--ease-out), border-color 140ms var(--ease-out), transform 140ms var(--ease-out);
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.button:not(:disabled):active {
+  transform: scale(0.98);
+}
+
+.button-primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.button-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--secondary);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .button:not(:disabled):hover {
+    background: var(--raised);
+    border-color: color-mix(in oklab, var(--ink) 20%, var(--line));
+  }
+
+  .button-primary:not(:disabled):hover {
+    background: color-mix(in oklab, var(--accent) 88%, var(--ink));
+    border-color: transparent;
+  }
+
+  .button-quiet:not(:disabled):hover {
+    background: var(--raised);
+    border-color: transparent;
+    color: var(--ink);
+  }
+}
+
+.tabular {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
