@@ -1,5 +1,4 @@
 import asyncio
-import io
 import logging
 import os
 import re
@@ -45,6 +44,12 @@ EMBEDDING_SIZE = 384
 DENSE_VECTOR_NAME = "dense"
 BM25_VECTOR_NAME = "bm25"
 BM25_MODEL_NAME = "Qdrant/bm25"
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+UPSERT_BATCH_SIZE = int(os.getenv("UPSERT_BATCH_SIZE", "64"))
+QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "10"))
+MAX_PDF_SIZE_BYTES = int(os.getenv("MAX_PDF_SIZE_MB", "50")) * 1024 * 1024
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "500"))
+MAX_CHUNKS_PER_PDF = int(os.getenv("MAX_CHUNKS_PER_PDF", "20000"))
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -158,7 +163,7 @@ async def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ensure_collection()
-    document_queue = asyncio.Queue()
+    document_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     worker_task = asyncio.create_task(document_worker())
     logger.info("Qdrant ready: url=%s collection=%s", QDRANT_URL, QDRANT_COLLECTION)
     logger.info("Upload dir: %s", UPLOAD_DIR)
@@ -254,14 +259,13 @@ def get_deepseek_client():
     return deepseek_client
 
 
-def extract_pages(content: bytes) -> list[str]:
-    reader = PdfReader(io.BytesIO(content))
-    pages = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        pages.append(text)
-        logger.info("Page %s extracted, length=%s", i + 1, len(text))
-    return pages
+def iter_page_texts(file_path: Path):
+    with file_path.open("rb") as source:
+        reader = PdfReader(source)
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            logger.info("Page %s extracted, length=%s", page_number, len(text))
+            yield page_number, text
 
 
 def normalize_text(text: str) -> str:
@@ -384,12 +388,11 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[st
     return deduped
 
 
-def create_chunks(pages: list[str]) -> list[dict]:
-    chunks = []
-    for page_num, text in enumerate(pages, start=1):
-        for idx, chunk in enumerate(chunk_text(text)):
-            chunks.append({"page": page_num, "chunk_index": idx, "text": chunk})
-    return chunks
+def create_chunks_for_page(text: str, page_number: int) -> list[dict]:
+    return [
+        {"page": page_number, "chunk_index": chunk_index, "text": chunk}
+        for chunk_index, chunk in enumerate(chunk_text(text))
+    ]
 
 
 def create_dense_embeddings(chunks: list[dict]) -> list[list[float]]:
@@ -448,8 +451,8 @@ def store_vectors(
         )
 
     try:
-        for i in range(0, len(points), 64):
-            batch = points[i : i + 64]
+        for i in range(0, len(points), UPSERT_BATCH_SIZE):
+            batch = points[i : i + UPSERT_BATCH_SIZE]
             qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=batch)
         logger.info("Stored %s vectors in %s", len(points), QDRANT_COLLECTION)
     except Exception as e:
@@ -457,6 +460,39 @@ def store_vectors(
         raise RuntimeError(f"Failed to store vectors in Qdrant: {e}") from e
 
     return len(points)
+
+
+def flush_batch(document: Document, chunks: list[dict]) -> int:
+    if not chunks:
+        return 0
+
+    dense_embeddings = create_dense_embeddings(chunks)
+    sparse_embeddings = create_sparse_embeddings(chunks)
+    stored = store_vectors(
+        chunks,
+        dense_embeddings,
+        sparse_embeddings,
+        document.filename,
+        document.user_id,
+        document.id,
+    )
+    logger.info("Flushed batch of %s chunks for document %s", len(chunks), document.id)
+    return stored
+
+
+def delete_document_vectors(document_id: str, user_id: str | None = None) -> None:
+    conditions = [FieldCondition(key="document_id", match=MatchValue(value=document_id))]
+    if user_id:
+        conditions.append(FieldCondition(key="user_id", match=MatchValue(value=user_id)))
+
+    try:
+        qdrant_client.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=Filter(must=conditions),
+        )
+        logger.info("Deleted vectors for document %s", document_id)
+    except Exception:
+        logger.exception("Failed to delete vectors for document %s", document_id)
 
 
 class SearchRequest(BaseModel):
@@ -478,12 +514,18 @@ class AuthRequest(BaseModel):
 
 def process_document(document_id: str) -> None:
     db = SessionLocal()
+    user_id_for_cleanup = None
     try:
         document = db.query(Document).filter(Document.id == document_id).first()
         if not document:
             raise RuntimeError(f"Document {document_id} not found")
 
+        user_id_for_cleanup = document.user_id
         document.status = "processing"
+        document.pages = 0
+        document.chunks = 0
+        document.vectors_stored = 0
+        document.error = None
         document.updated_at = datetime.now(timezone.utc)
         db.commit()
 
@@ -491,27 +533,51 @@ def process_document(document_id: str) -> None:
         if not file_path.exists():
             raise RuntimeError(f"PDF file not found: {file_path}")
 
-        content = file_path.read_bytes()
-        pages = extract_pages(content)
-        chunks = create_chunks(pages)
+        pending_chunks: list[dict] = []
+        total_pages = 0
+        total_chunks = 0
+        total_vectors = 0
 
-        dense_embeddings = create_dense_embeddings(chunks)
-        sparse_embeddings = create_sparse_embeddings(chunks)
-        vectors_stored = store_vectors(
-            chunks, dense_embeddings, sparse_embeddings, document.filename, document.user_id, document.id
-        )
+        def update_progress() -> None:
+            document.pages = total_pages
+            document.chunks = total_chunks
+            document.vectors_stored = total_vectors
+            document.updated_at = datetime.now(timezone.utc)
+            db.commit()
 
-        document.pages = len(pages)
-        document.chunks = len(chunks)
-        document.vectors_stored = vectors_stored
+        for page_number, page_text in iter_page_texts(file_path):
+            total_pages += 1
+            if total_pages > MAX_PDF_PAGES:
+                raise RuntimeError(f"PDF exceeds max page limit of {MAX_PDF_PAGES}")
+
+            for chunk in create_chunks_for_page(page_text, page_number):
+                total_chunks += 1
+                if total_chunks > MAX_CHUNKS_PER_PDF:
+                    raise RuntimeError(f"PDF exceeds max chunk limit of {MAX_CHUNKS_PER_PDF}")
+                pending_chunks.append(chunk)
+
+                if len(pending_chunks) >= EMBED_BATCH_SIZE:
+                    total_vectors += flush_batch(document, pending_chunks)
+                    pending_chunks.clear()
+                    update_progress()
+
+        if pending_chunks:
+            total_vectors += flush_batch(document, pending_chunks)
+            pending_chunks.clear()
+            update_progress()
+
+        document.pages = total_pages
+        document.chunks = total_chunks
+        document.vectors_stored = total_vectors
         document.status = "completed"
         document.error = None
         document.updated_at = datetime.now(timezone.utc)
         db.commit()
-        logger.info("Document %s processed: %s vectors", document_id, vectors_stored)
+        logger.info("Document %s processed: %s vectors", document_id, total_vectors)
     except Exception as e:
         logger.exception("Failed to process document %s", document_id)
         db.rollback()
+        delete_document_vectors(document_id, user_id_for_cleanup)
         document = db.query(Document).filter(Document.id == document_id).first()
         if document:
             document.status = "failed"
@@ -589,6 +655,8 @@ async def upload_pdf(
 ):
     if document_queue is None:
         raise HTTPException(status_code=503, detail="Document worker is not ready")
+    if document_queue.full():
+        raise HTTPException(status_code=429, detail="Upload queue is full, please retry later")
 
     filename = file.filename or "unknown.pdf"
     if not filename.lower().endswith(".pdf"):
@@ -601,13 +669,24 @@ async def upload_pdf(
     file_path = user_dir / f"{document_id}.pdf"
 
     size = 0
+    too_large = False
     with file_path.open("wb") as out:
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
-            out.write(chunk)
             size += len(chunk)
+            if size > MAX_PDF_SIZE_BYTES:
+                too_large = True
+                break
+            out.write(chunk)
+
+    if too_large:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF exceeds max size of {MAX_PDF_SIZE_BYTES // (1024 * 1024)} MB",
+        )
 
     if size == 0:
         file_path.unlink(missing_ok=True)
@@ -628,7 +707,14 @@ async def upload_pdf(
     db.commit()
     db.refresh(document)
 
-    await document_queue.put(document_id)
+    try:
+        document_queue.put_nowait(document_id)
+    except asyncio.QueueFull:
+        db.delete(document)
+        db.commit()
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=429, detail="Upload queue is full, please retry later")
+
     logger.info("Queued document %s: filename=%s size=%s", document_id, filename, size)
 
     return {
