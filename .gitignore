@@ -28,3 +28,10 @@ ENV/
 
 # Backend env
 backend/.env
+
+# Uploads
+backend/uploads/
+
+# SQLite
+*.db
+*.db-journal

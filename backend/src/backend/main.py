@@ -1,9 +1,11 @@
+import asyncio
 import io
 import logging
 import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import bcrypt
 import jwt
@@ -28,7 +30,7 @@ from qdrant_client.models import (
     SparseVectorParams,
     VectorParams,
 )
-from sqlalchemy import Column, DateTime, String, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 load_dotenv()
@@ -51,6 +53,8 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-env")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BACKEND_DIR / "uploads"))).resolve()
 
 app = FastAPI()
 security = HTTPBearer()
@@ -58,6 +62,8 @@ security = HTTPBearer()
 embedding_model = None
 bm25_model = None
 deepseek_client = None
+document_queue: asyncio.Queue[str] | None = None
+worker_task: asyncio.Task | None = None
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 engine = create_engine(
@@ -75,6 +81,24 @@ class User(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id = Column(String, primary_key=True, index=True)
+    upload_id = Column(String, index=True, nullable=False)
+    user_id = Column(String, index=True, nullable=False)
+    filename = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    size = Column(Integer, nullable=False)
+    status = Column(String, index=True, nullable=False)
+    pages = Column(Integer, nullable=True)
+    chunks = Column(Integer, nullable=True)
+    vectors_stored = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 def get_db():
@@ -116,15 +140,38 @@ def ensure_collection() -> None:
                 field_schema=PayloadSchemaType.KEYWORD,
             )
             logger.info("Created payload index on user_id for %s", QDRANT_COLLECTION)
+        if "document_id" not in payload_schema:
+            qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="document_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            logger.info("Created payload index on document_id for %s", QDRANT_COLLECTION)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Qdrant collection '{QDRANT_COLLECTION}': {e}") from e
 
 
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
+    global document_queue, worker_task
+
     Base.metadata.create_all(bind=engine)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ensure_collection()
+    document_queue = asyncio.Queue()
+    worker_task = asyncio.create_task(document_worker())
     logger.info("Qdrant ready: url=%s collection=%s", QDRANT_URL, QDRANT_COLLECTION)
+    logger.info("Upload dir: %s", UPLOAD_DIR)
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    if worker_task is not None:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
 
 
 def hash_password(password: str) -> str:
@@ -374,8 +421,8 @@ def store_vectors(
     sparse_embeddings: list[SparseVector],
     filename: str,
     user_id: str,
-) -> tuple[str, int]:
-    upload_id = str(uuid.uuid4())
+    document_id: str,
+) -> int:
     now = datetime.now(timezone.utc).isoformat()
     points = []
     for chunk, dense_embedding, sparse_embedding in zip(chunks, dense_embeddings, sparse_embeddings):
@@ -387,7 +434,8 @@ def store_vectors(
                     BM25_VECTOR_NAME: sparse_embedding,
                 },
                 payload={
-                    "upload_id": upload_id,
+                    "upload_id": document_id,
+                    "document_id": document_id,
                     "user_id": user_id,
                     "filename": filename,
                     "page": chunk["page"],
@@ -406,9 +454,9 @@ def store_vectors(
         logger.info("Stored %s vectors in %s", len(points), QDRANT_COLLECTION)
     except Exception as e:
         logger.exception("Failed to store vectors in Qdrant")
-        raise HTTPException(status_code=500, detail=f"Failed to store vectors in Qdrant: {e}") from e
+        raise RuntimeError(f"Failed to store vectors in Qdrant: {e}") from e
 
-    return upload_id, len(points)
+    return len(points)
 
 
 class SearchRequest(BaseModel):
@@ -426,6 +474,69 @@ class AskRequest(BaseModel):
 class AuthRequest(BaseModel):
     username: str
     password: str
+
+
+def process_document(document_id: str) -> None:
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            raise RuntimeError(f"Document {document_id} not found")
+
+        document.status = "processing"
+        document.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+        file_path = Path(document.file_path)
+        if not file_path.exists():
+            raise RuntimeError(f"PDF file not found: {file_path}")
+
+        content = file_path.read_bytes()
+        pages = extract_pages(content)
+        chunks = create_chunks(pages)
+
+        dense_embeddings = create_dense_embeddings(chunks)
+        sparse_embeddings = create_sparse_embeddings(chunks)
+        vectors_stored = store_vectors(
+            chunks, dense_embeddings, sparse_embeddings, document.filename, document.user_id, document.id
+        )
+
+        document.pages = len(pages)
+        document.chunks = len(chunks)
+        document.vectors_stored = vectors_stored
+        document.status = "completed"
+        document.error = None
+        document.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        logger.info("Document %s processed: %s vectors", document_id, vectors_stored)
+    except Exception as e:
+        logger.exception("Failed to process document %s", document_id)
+        db.rollback()
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if document:
+            document.status = "failed"
+            document.error = str(e)
+            document.updated_at = datetime.now(timezone.utc)
+            db.commit()
+        raise
+    finally:
+        db.close()
+
+
+async def document_worker() -> None:
+    while True:
+        if document_queue is None:
+            await asyncio.sleep(0.1)
+            continue
+        document_id = await document_queue.get()
+        try:
+            logger.info("Worker picked up document %s", document_id)
+            await asyncio.to_thread(process_document, document_id)
+            logger.info("Worker finished document %s", document_id)
+        except Exception:
+            logger.exception("Worker failed on document %s", document_id)
+        finally:
+            document_queue.task_done()
 
 
 @app.post("/auth/register")
@@ -471,37 +582,61 @@ def login(request: AuthRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
-    content = await file.read()
-    logger.info("Received PDF: filename=%s size=%s", file.filename, len(content))
+async def upload_pdf(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if document_queue is None:
+        raise HTTPException(status_code=503, detail="Document worker is not ready")
 
-    pages = extract_pages(content)
-    chunks = create_chunks(pages)
+    filename = file.filename or "unknown.pdf"
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    for chunk in chunks:
-        logger.info(
-            "Chunk page=%s index=%s length=%s text=%r",
-            chunk["page"],
-            chunk["chunk_index"],
-            len(chunk["text"]),
-            chunk["text"][:200],
-        )
+    document_id = str(uuid.uuid4())
+    upload_id = document_id
+    user_dir = UPLOAD_DIR / current_user.id
+    user_dir.mkdir(parents=True, exist_ok=True)
+    file_path = user_dir / f"{document_id}.pdf"
 
-    dense_embeddings = create_dense_embeddings(chunks)
-    sparse_embeddings = create_sparse_embeddings(chunks)
-    upload_id, vectors_stored = store_vectors(
-        chunks, dense_embeddings, sparse_embeddings, file.filename or "unknown.pdf", current_user.id
+    size = 0
+    with file_path.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            size += len(chunk)
+
+    if size == 0:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    document = Document(
+        id=document_id,
+        upload_id=upload_id,
+        user_id=current_user.id,
+        filename=filename,
+        file_path=str(file_path),
+        size=size,
+        status="queued",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
     )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    await document_queue.put(document_id)
+    logger.info("Queued document %s: filename=%s size=%s", document_id, filename, size)
 
     return {
+        "document_id": document_id,
         "upload_id": upload_id,
-        "filename": file.filename,
-        "pages": len(pages),
-        "chunks": len(chunks),
-        "embeddings_created": len(dense_embeddings),
-        "embedding_dimension": len(dense_embeddings[0]) if dense_embeddings else 0,
-        "collection": QDRANT_COLLECTION,
-        "vectors_stored": vectors_stored,
+        "filename": filename,
+        "size": size,
+        "status": "queued",
     }
 
 
@@ -566,6 +701,7 @@ def retrieve_matches(query: str, top_k: int, mode: str, user_id: str) -> list[di
                 "page": payload.get("page"),
                 "chunk_index": payload.get("chunk_index"),
                 "upload_id": payload.get("upload_id"),
+                "document_id": payload.get("document_id"),
             }
         )
     return matches
@@ -654,6 +790,7 @@ async def ask(request: AskRequest, current_user: User = Depends(get_current_user
             "chunk_index": m.get("chunk_index"),
             "score": m.get("score"),
             "upload_id": m.get("upload_id"),
+            "document_id": m.get("document_id"),
         }
         for m in matches
     ]
